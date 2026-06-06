@@ -1,0 +1,44 @@
+workflows:
+  ios-sideload:
+    name: Build unsigned IPA for sideloading
+    instance_type: mac_mini_m2
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+      vars:
+        BUNDLE_ID: "io.github.tiefseetauchner.tiefprompt"
+        APP_NAME: "TiefPrompt"
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: main
+          include: true
+          source: true
+    scripts:
+      - name: Install dependencies
+        script: |
+          flutter pub get
+          cd ios && pod install --repo-update
+
+      - name: Build Flutter iOS release
+        script: |
+          flutter build ios --release --no-codesign \
+            --target lib/main_foss.dart
+
+      - name: Package unsigned IPA
+        script: |
+          mkdir -p build/ios/ipa/Payload
+          cp -R build/ios/Release-iphoneos/Runner.app build/ios/ipa/Payload/
+          cd build/ios/ipa
+          zip -r "${APP_NAME}.ipa" Payload/
+    artifacts:
+      - build/ios/ipa/*.ipa
+    publishing:
+      email:
+        recipients:
+          - builder@example.com
+        notify:
+          success: false
+          failure: true
