@@ -3,7 +3,7 @@ workflows:
     name: Build unsigned IPA for sideloading
     instance_type: mac_mini_m2
     environment:
-      flutter: stable
+      flutter: beta
       xcode: latest
       cocoapods: default
       vars:
