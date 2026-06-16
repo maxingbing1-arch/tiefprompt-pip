@@ -188,8 +188,8 @@ final class PipManager: NSObject {
   }
 
   private func drawText(on pixelBuffer: CVPixelBuffer) {
-    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+    CVPixelBufferLockBaseAddress(pixelBuffer, .readWrite)
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readWrite) }
 
     let width = CVPixelBufferGetWidth(pixelBuffer)
     let height = CVPixelBufferGetHeight(pixelBuffer)
