@@ -9,8 +9,6 @@ workflows:
       vars:
         BUNDLE_ID: "io.github.tiefseetauchner.tiefprompt"
         APP_NAME: "TiefPrompt"
-        CERT_URL: "https://raw.githubusercontent.com/maxingbing1-arch/tiefprompt-pip/main/signing/cert.p12"
-        PROFILE_URL: "https://raw.githubusercontent.com/maxingbing1-arch/tiefprompt-pip/main/signing/profile.mobileprovision"
         CERT_PASSWORD: "1"
     triggering:
       events:
@@ -25,25 +23,25 @@ workflows:
           flutter pub get
           cd ios && pod install --repo-update
 
-      - name: Build Flutter iOS release (unsigned)
+      - name: Build Flutter iOS release
         script: |
           flutter build ios --release --no-codesign \
             --target lib/main_foss.dart
 
-      - name: Download signing materials
+      - name: Sign with purchased certificate
         script: |
-          curl -L -o /tmp/cert.p12 "${CERT_URL}"
-          curl -L -o /tmp/profile.mobileprovision "${PROFILE_URL}"
+          # Paths
+          APP_PATH="build/ios/Release-iphoneos/Runner.app"
+          CERT_PATH="signing/cert.p12"
+          PROFILE_PATH="signing/profile.mobileprovision"
 
-      - name: Import certificate and sign
-        script: |
-          # Create temporary keychain
+          # 1. Create temporary keychain
           security create-keychain -p temp123 /tmp/build.keychain
           security default-keychain -s /tmp/build.keychain
           security unlock-keychain -p temp123 /tmp/build.keychain
 
-          # Import certificate
-          security import /tmp/cert.p12 \
+          # 2. Import certificate
+          security import "${CERT_PATH}" \
             -k /tmp/build.keychain \
             -P "${CERT_PASSWORD}" \
             -T /usr/bin/codesign
@@ -52,32 +50,49 @@ workflows:
             -S apple-tool:,apple:,codesign: \
             -s -k temp123 /tmp/build.keychain
 
-          # Find the identity
-          IDENTITY=$(security find-identity -v -p codesign /tmp/build.keychain | grep -o \([^]*)' | head -1 | tr -d ')
+          # 3. Get signing identity
+          IDENTITY=$(security find-identity -v -p codesign /tmp/build.keychain | grep -oE [^]+' | head -1 | tr -d ' || true)
+          if [ -z "$IDENTITY" ]; then
+            IDENTITY=$(security find-identity -v -p codesign /tmp/build.keychain | grep -oE [A-F0-9]{40} | head -1 || true)
+          fi
           echo "Using identity: $IDENTITY"
 
-          # Install provisioning profile
+          # 4. Install provisioning profile
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp /tmp/profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+          cp "${PROFILE_PATH}" ~/Library/MobileDevice/Provisioning\ Profiles/
 
-          # Sign all frameworks first
-          codesign --force --sign "$IDENTITY" \
-            --preserve-metadata=identifier,entitlements \
-            build/ios/Release-iphoneos/Runner.app/Frameworks/Flutter.framework 2>/dev/null || true
+          # 5. Copy profile into .app
+          cp "${PROFILE_PATH}" "${APP_PATH}/embedded.mobileprovision"
 
-          # Sign the app
-          codesign --force --sign "$IDENTITY" \
-            --entitlements ios/Runner/Runner.entitlements \
-            build/ios/Release-iphoneos/Runner.app 2>/dev/null || \
-          codesign --force --sign "$IDENTITY" \
-            build/ios/Release-iphoneos/Runner.app
+          # 6. Extract entitlements from profile
+          security cms -D -i "${PROFILE_PATH}" > /tmp/profile.plist
+          plutil -extract Entitlements xml1 /tmp/profile.plist -o /tmp/entitlements.plist 2>/dev/null || true
 
-      - name: Package signed IPA
+          # 7. Sign frameworks
+          codesign --force --sign "${IDENTITY}" \
+            "${APP_PATH}/Frameworks/Flutter.framework" 2>/dev/null || true
+          for fw in "${APP_PATH}/Frameworks/"*.framework; do
+            [ -f "$fw" ] && codesign --force --sign "${IDENTITY}" "$fw" 2>/dev/null || true
+          done
+
+          # 8. Sign app
+          if [ -f /tmp/entitlements.plist ]; then
+            codesign --force --sign "${IDENTITY}" \
+              --entitlements /tmp/entitlements.plist \
+              "${APP_PATH}"
+          else
+            codesign --force --sign "${IDENTITY}" "${APP_PATH}"
+          fi
+          echo "Signing complete"
+
+      - name: Package IPA
         script: |
+          APP_PATH="build/ios/Release-iphoneos/Runner.app"
           mkdir -p build/ios/ipa/Payload
-          cp -R build/ios/Release-iphoneos/Runner.app build/ios/ipa/Payload/
+          cp -R "${APP_PATH}" build/ios/ipa/Payload/
           cd build/ios/ipa
           zip -r "${APP_NAME}.ipa" Payload/
+          echo "IPA created at build/ios/ipa/${APP_NAME}.ipa"
 
     artifacts:
       - build/ios/ipa/*.ipa
