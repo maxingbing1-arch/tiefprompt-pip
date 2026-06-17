@@ -1,12 +1,8 @@
 import AVKit
-import CoreImage
 import UIKit
 
-/// Renders teleprompter text line-by-line into a PiP floating window.
-///
-/// The native side independently scrolls through lines once started.
-/// Flutter controls start/stop, speed, settings and line-position via
-/// method channel commands.
+/// Renders teleprompter text into a PiP floating window with smooth
+/// continuous pixel-based scrolling.
 @available(iOS 15.0, *)
 final class PipManager: NSObject {
   // ── PiP primitives ────────────────────────────────────────────
@@ -16,20 +12,27 @@ final class PipManager: NSObject {
   // ── Render loop ───────────────────────────────────────────────
   private var displayLink: CADisplayLink?
   private var pixelBufferPool: CVPixelBufferPool?
-  private let canvasWidth = 720
-  private let canvasHeight = 400
   private var frameCount: Int64 = 0
 
-  // ── Scrolling state ───────────────────────────────────────────
-  private var lines: [String] = []
-  private var lineIndex: Int = 0
-  private var lineProgress: Double = 0.0  // 0..1 fractional progress within current line
+  // ── Scrolling state (continuous pixels, not lines) ────────────
+  private var displayText: NSAttributedString?
+  private var totalTextHeight: CGFloat = 0
+  /// Current scroll offset in points from the top of the text.
+  private var scrollOffset: CGFloat = 0
+  /// Scroll speed in points per second.
+  private var speed: CGFloat = 60
+  private var isPlaying = false
 
   // ── Settings (set from Flutter) ────────────────────────────────
   var fontSize: CGFloat = 56
   var isMirrored = false
-  /// Lines per second to advance (1 = one line per second ≈ 60 wpm)
-  private var speed: Double = 0.33
+
+  // MARK: - Canvas dimensions
+
+  /// The PiP canvas matches the display layer's natural size.
+  /// On iPad this gives ~720×540 which is legible even in a small PiP window.
+  private let canvasWidth = 720
+  private var canvasHeight: Int { 540 }
 
   // MARK: - Setup
 
@@ -48,7 +51,6 @@ final class PipManager: NSObject {
     )
     pipController = AVPictureInPictureController(contentSource: contentSource)
     pipController.canStartPictureInPictureAutomaticallyFromInline = true
-    createPixelBufferPool()
   }
 
   // MARK: - Public API
@@ -68,48 +70,71 @@ final class PipManager: NSObject {
     isMirrored: Bool,
     scrollOffset: Double
   ) {
-    self.lines = text
-      .components(separatedBy: "\n")
-      .map { $0.trimmingCharacters(in: .whitespaces) }
-      .filter { !$0.isEmpty }
-    self.speed = speed
+    // speed value from app (0.1-20) → points per second
+    self.speed = max(1, CGFloat(speed * 80))
     self.fontSize = fontSize
     self.isMirrored = isMirrored
+    self.scrollOffset = 0
+    self.isPlaying = true
 
-    // Estimate line index from scroll offset
-    if !self.lines.isEmpty {
-      let totalLines = self.lines.count
-      let estimatedLine = Int((scrollOffset / 1000) * Double(totalLines))
-      lineIndex = min(max(estimatedLine, 0), totalLines - 1)
-    } else {
-      lineIndex = 0
-    }
-    lineProgress = 0
-
+    buildDisplayText(text)
+    createPixelBufferPool()
     startDisplayLink()
     pipController.startPictureInPicture()
   }
 
   func stop() {
+    isPlaying = false
     pipController.stopPictureInPicture()
     stopDisplayLink()
   }
 
   func updateSpeed(_ newSpeed: Double) {
-    speed = newSpeed
+    speed = max(1, CGFloat(newSpeed * 80))
   }
 
   func updateSettings(fontSize: CGFloat?, mirrored: Bool?) {
-    if let fs = fontSize { self.fontSize = fs }
+    var needsRebuild = false
+    if let fs = fontSize {
+      self.fontSize = fs
+      needsRebuild = true
+    }
     if let m = mirrored { self.isMirrored = m }
+    // Rebuild text layout when font size changes
+    if needsRebuild, let text = displayText {
+      buildDisplayText(text.string)
+    }
   }
 
   func seekTo(scrollOffset: Double) {
-    guard !lines.isEmpty else { return }
-    let totalLines = lines.count
-    let estimatedLine = Int((scrollOffset / 1000) * Double(totalLines))
-    lineIndex = min(max(estimatedLine, 0), totalLines - 1)
-    lineProgress = 0
+    self.scrollOffset = max(0, CGFloat(scrollOffset))
+  }
+
+  // MARK: - Text layout
+
+  private func buildDisplayText(_ text: String) {
+    let paraStyle = NSMutableParagraphStyle()
+    paraStyle.alignment = .center
+    paraStyle.lineSpacing = fontSize * 0.12
+    paraStyle.paragraphSpacing = fontSize * 0.3
+
+    let attrText = NSAttributedString(
+      string: text,
+      attributes: [
+        .font: UIFont.systemFont(ofSize: fontSize),
+        .foregroundColor: UIColor.white,
+        .paragraphStyle: paraStyle,
+      ]
+    )
+    displayText = attrText
+
+    // Estimate total rendered height
+    let framesetter = CTFramesetterCreateWithAttributedString(attrText)
+    let constraints = CGSize(width: CGFloat(canvasWidth) - 32, height: .greatestFiniteMagnitude)
+    let bounds = CTFramesetterSuggestFrameSizeWithConstraints(
+      framesetter, CFRange(), nil, constraints, nil
+    )
+    totalTextHeight = ceil(max(bounds.height, 1))
   }
 
   // MARK: - Pixel buffer pool
@@ -144,27 +169,21 @@ final class PipManager: NSObject {
   // MARK: - Frame rendering
 
   @objc private func renderFrame() {
-    advanceLineIfNeeded()
+    advanceScroll()
     guard let buffer = nextPixelBuffer() else { return }
     drawText(on: buffer)
     enqueue(buffer)
     frameCount += 1
   }
 
-  private func advanceLineIfNeeded() {
-    guard !lines.isEmpty else { return }
-    // Each "speed" unit = 1 line per second
-    // At 30 fps, each frame advances by speed/30 lines
-    let advance = speed / 30.0
-    lineProgress += advance
-
-    while lineProgress >= 1.0 {
-      lineProgress -= 1.0
-      lineIndex += 1
-      if lineIndex >= lines.count {
-        lineIndex = 0  // loop back to beginning
-      }
+  private func advanceScroll() {
+    guard isPlaying, let _ = displayText, totalTextHeight > 0 else { return }
+    guard scrollOffset < totalTextHeight else {
+      // Reached the end — stop scrolling
+      isPlaying = false
+      return
     }
+    scrollOffset += speed / 30.0
   }
 
   // MARK: - Pixel buffer helpers
@@ -210,57 +229,39 @@ final class PipManager: NSObject {
     context.setFillColor(UIColor.black.cgColor)
     context.fill(CGRect(x: 0, y: 0, width: width, height: height))
 
+    guard let text = displayText, text.length > 0 else { return }
+
     context.saveGState()
+
+    // Horizontal mirror
     if isMirrored {
       context.translateBy(x: CGFloat(width), y: 0)
       context.scaleBy(x: -1, y: 1)
     }
 
-    // Current line text
-    let displayText: String
-    if lines.isEmpty {
-      displayText = "—"
-    } else {
-      displayText = lines[min(lineIndex, lines.count - 1)]
-    }
+    // Flip vertically so Core Text lays out top-to-bottom
+    context.translateBy(x: 0, y: CGFloat(height))
+    context.scaleBy(x: 1.0, y: -1.0)
 
-    // Use a large font for readability in the small PiP window
-    let font = UIFont.systemFont(ofSize: fontSize)
-    let attrString = NSAttributedString(
-      string: displayText,
-      attributes: [
-        .font: font,
-        .foregroundColor: UIColor.white,
-      ]
+    // Clip to visible canvas area
+    context.clip(to: CGRect(x: 0, y: 0, width: width, height: height))
+
+    // The text frame starts above the visible area by scrollOffset pixels.
+    // As scrollOffset increases, the text slides upward (it enters
+    // the visible area from the bottom and exits at the top).
+    let textRect = CGRect(
+      x: 16,
+      y: -scrollOffset,
+      width: CGFloat(width) - 32,
+      height: max(totalTextHeight + scrollOffset + CGFloat(height), 200)
     )
-    let line = CTLineCreateWithAttributedString(attrString)
-    let bounds = CTLineGetBoundsWithOptions(line, .useOpticalBounds)
 
-    // Break into words if too wide, by drawing smaller
-    var effectiveFontSize = fontSize
-    if bounds.width > CGFloat(width) - 32 {
-      // Scale down to fit
-      let scale = (CGFloat(width) - 32) / bounds.width
-      effectiveFontSize = fontSize * min(scale, 1.0)
-      let scaledAttr = NSAttributedString(
-        string: displayText,
-        attributes: [
-          .font: UIFont.systemFont(ofSize: effectiveFontSize),
-          .foregroundColor: UIColor.white,
-        ]
-      )
-      let scaledLine = CTLineCreateWithAttributedString(scaledAttr)
-      let scaledBounds = CTLineGetBoundsWithOptions(scaledLine, .useOpticalBounds)
-      let drawX = max(16, (CGFloat(width) - scaledBounds.width) / 2)
-      let drawY = (CGFloat(height) - scaledBounds.height) / 2 + scaledBounds.origin.y
-      context.textPosition = CGPoint(x: drawX, y: drawY)
-      CTLineDraw(scaledLine, context)
-    } else {
-      let drawX = (CGFloat(width) - bounds.width) / 2
-      let drawY = (CGFloat(height) - bounds.height) / 2 + bounds.origin.y
-      context.textPosition = CGPoint(x: drawX, y: drawY)
-      CTLineDraw(line, context)
-    }
+    let path = CGPath(rect: textRect, transform: nil)
+    let framesetter = CTFramesetterCreateWithAttributedString(text)
+    let frame = CTFramesetterCreateFrame(
+      framesetter, CFRange(location: 0, length: text.length), path, nil
+    )
+    CTFrameDraw(frame, context)
 
     context.restoreGState()
   }
@@ -303,11 +304,11 @@ extension PipManager: AVPictureInPictureSampleBufferPlaybackDelegate {
   func pictureInPictureController(_: AVPictureInPictureController, setPlaying _: Bool) {}
 
   func pictureInPictureControllerTimeRangeForPlayback(_: AVPictureInPictureController) -> CMTimeRange {
-    CMTimeRange(start: .zero, duration: CMTime(value: Int64(lines.count), timescale: 30))
+    CMTimeRange(start: .zero, duration: CMTime(value: 600, timescale: 30))
   }
 
   func pictureInPictureControllerIsPlaybackPaused(_: AVPictureInPictureController) -> Bool {
-    false
+    !isPlaying
   }
 
   func pictureInPictureController(_: AVPictureInPictureController, didTransitionToRenderSize _: CMVideoDimensions) {}
